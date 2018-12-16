@@ -279,6 +279,7 @@ class Model(Network):
             raise TypeError('Could not interpret loss_weights argument: ' +
                             str(loss_weights) +
                             ' - expected a list of dicts.')
+        self.loss_weights_list = loss_weights_list
 
         # Initialize metrics variables
         self._init_metric_attributes()
@@ -1120,47 +1121,69 @@ class Model(Network):
                 val_inputs = val_x + val_y + val_sample_weights + [0.]
             else:
                 val_inputs = val_x + val_y + val_sample_weights
-
         elif validation_steps:
             do_validation = True
             if self._uses_dynamic_learning_phase():
                 val_inputs = [0.]
-
-        # Prepare input arrays and training function.
-        if self._uses_dynamic_learning_phase():
-            fit_inputs = x + y + sample_weights + [1.]
         else:
-            fit_inputs = x + y + sample_weights
-        self._make_train_function()
-        fit_function = self.train_function
+            val_x = None
+            val_y = None
+            val_sample_weights = None
 
-        # Prepare display labels.
-        out_labels = self.metrics_names
-
-        if do_validation:
-            self._make_test_function()
-            val_function = self.test_function
-            callback_metrics = copy.copy(out_labels) + [
-                'val_' + n for n in out_labels]
+        if K.eager:
+            return training_jax.fit_loop(
+                self,
+                inputs=x,
+                targets=y,
+                sample_weights=sample_weights,
+                class_weight=class_weight,
+                batch_size=batch_size,
+                epochs=epochs,
+                verbose=verbose,
+                callbacks=callbacks,
+                val_inputs=val_x,
+                val_targets=val_y,
+                val_sample_weights=val_sample_weights,
+                shuffle=shuffle,
+                initial_epoch=initial_epoch,
+                steps_per_epoch=steps_per_epoch,
+                validation_steps=validation_steps)
         else:
-            callback_metrics = copy.copy(out_labels)
-            val_function = None
-            val_inputs = []
+            # Prepare input arrays and training function.
+            if self._uses_dynamic_learning_phase():
+                fit_inputs = x + y + sample_weights + [1.]
+            else:
+                fit_inputs = x + y + sample_weights
+            self._make_train_function()
+            fit_function = self.train_function
 
-        # Delegate logic to `fit_loop`.
-        return training_arrays.fit_loop(self, fit_function, fit_inputs,
-                                        out_labels=out_labels,
-                                        batch_size=batch_size,
-                                        epochs=epochs,
-                                        verbose=verbose,
-                                        callbacks=callbacks,
-                                        val_function=val_function,
-                                        val_inputs=val_inputs,
-                                        shuffle=shuffle,
-                                        callback_metrics=callback_metrics,
-                                        initial_epoch=initial_epoch,
-                                        steps_per_epoch=steps_per_epoch,
-                                        validation_steps=validation_steps)
+            # Prepare display labels.
+            out_labels = self.metrics_names
+
+            if do_validation:
+                self._make_test_function()
+                val_function = self.test_function
+                callback_metrics = copy.copy(out_labels) + [
+                    'val_' + n for n in out_labels]
+            else:
+                callback_metrics = copy.copy(out_labels)
+                val_function = None
+                val_inputs = []
+
+            # Delegate logic to `fit_loop`.
+            return training_arrays.fit_loop(self, fit_function, fit_inputs,
+                                            out_labels=out_labels,
+                                            batch_size=batch_size,
+                                            epochs=epochs,
+                                            verbose=verbose,
+                                            callbacks=callbacks,
+                                            val_function=val_function,
+                                            val_inputs=val_inputs,
+                                            shuffle=shuffle,
+                                            callback_metrics=callback_metrics,
+                                            initial_epoch=initial_epoch,
+                                            steps_per_epoch=steps_per_epoch,
+                                            validation_steps=validation_steps)
 
     def evaluate(self, x=None, y=None,
                  batch_size=None,
@@ -1338,12 +1361,16 @@ class Model(Network):
             x, y,
             sample_weight=sample_weight,
             class_weight=class_weight)
-        if self._uses_dynamic_learning_phase():
-            ins = x + y + sample_weights + [1.]
+        if K.eager:
+            outputs = training_jax.train_on_batch(
+                self, x, y, sample_weights=sample_weights)
         else:
-            ins = x + y + sample_weights
-        self._make_train_function()
-        outputs = self.train_function(ins)
+            if self._uses_dynamic_learning_phase():
+                ins = x + y + sample_weights + [1.]
+            else:
+                ins = x + y + sample_weights
+            self._make_train_function()
+            outputs = self.train_function(ins)
         return unpack_singleton(outputs)
 
     def test_on_batch(self, x, y, sample_weight=None):

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 import numpy as onp
 import jax.numpy as np
+from jax import lax
 # import jax.scipy.signal as signal # TODO!
 import jax.scipy as sp
 from keras.backend import floatx
@@ -637,7 +638,7 @@ def dtype(x):
 
 def constant(value, dtype=None, shape=None, name=None):
     if dtype is None:
-        dtype = np.dtype(floatx())
+        dtype = floatx()
     if shape is None:
         shape = ()
     np_value = value * np.ones(shape)
@@ -814,19 +815,19 @@ def identity(x, name=None):
 
 
 def cast(x, dtype):
-    raise NotImplementedError('Method "cast" for JAX backend currently not implemented')
+    return np.array(x, dtype=dtype)
 
 
 def update(x, new_x):
-    raise NotImplementedError('Method "update" for JAX backend currently not implemented')
+    return lax.dynamic_update_slice(x, new_x, onp.array(0))
 
 
 def update_add(x, increment):
-    raise NotImplementedError('Method "update_add" for JAX backend currently not implemented')
+    return lax.dynamic_update_slice(x, x + increment, onp.array(0))
 
 
 def update_sub(x, decrement):
-    raise NotImplementedError('Method "update_sub" for JAX backend currently not implemented')
+    return lax.dynamic_update_slice(x, x - decrement, onp.array(0))
 
 
 def moving_average_update(x, value, momentum):
