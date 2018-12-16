@@ -18,8 +18,12 @@ from .training_utils import standardize_input_data
 from .training_utils import standardize_sample_weights
 from .training_utils import standardize_weights
 from .training_utils import weighted_masked_objective
+from .training_utils import prepare_sample_weights
+from .training_utils import collect_per_output_metric_info
+from .training_utils import collect_per_output_metric_info
 from . import training_arrays
 from . import training_generator
+from . import training_jax
 from .. import backend as K
 from .. import optimizers
 from .. import losses
@@ -27,12 +31,104 @@ from .. import metrics as metrics_module
 from ..utils.generic_utils import slice_arrays
 from ..utils.generic_utils import to_list
 from ..utils.generic_utils import unpack_singleton
+from ..utils.generic_utils import DeferredNumpyArray
 from ..legacy import interfaces
 
 
 class Model(Network):
     """The `Model` class adds training & evaluation routines to a `Network`.
     """
+
+    def _init_metric_attributes(self):
+        """Initialized model metric attributes."""
+        self.metrics_names = ['loss']
+        self.metrics_tensors = []
+        self.metrics_updates = []
+        self.stateful_metric_names = []
+        self.stateful_metric_functions = []
+
+    def _set_sample_weight_attributes(self, sample_weight_mode, skip_target_weighing_indices):
+        """Sets sample weight related attributes on the model."""
+        sample_weights, sample_weight_modes = prepare_sample_weights(
+                self.output_names, sample_weight_mode, skip_target_weighing_indices)
+        self.sample_weights = sample_weights
+        self.sample_weight_modes = sample_weight_modes
+        self._feed_sample_weight_modes = [
+                sample_weight_modes[i]
+                for i in range(len(self.outputs))
+                if i not in skip_target_weighing_indices
+        ]
+        self._feed_sample_weights = [
+                sample_weights[i]
+                for i in range(len(sample_weights))
+                if i not in skip_target_weighing_indices
+        ]
+
+    def _cache_output_metric_attributes(self, metrics, weighted_metrics):
+        """Caches metric name and function attributes for every model output."""
+        output_shapes = [
+                None if output is None else output.get_shape()
+                for output in self.outputs
+        ]
+        self._per_output_metrics = collect_per_output_metric_info(
+                metrics, self.output_names, output_shapes, self.loss_functions)
+        self._per_output_weighted_metrics = \
+                collect_per_output_metric_info(
+                        weighted_metrics, self.output_names, output_shapes,
+                        self.loss_functions, self.sample_weights)
+
+    def _add_unique_metric_name(self, metric_name, output_index):
+        """Makes the metric name unique and adds it to the model's metric name list.
+
+            If there are multiple outputs for which the metrics are calculated, the
+            metric names have to be made unique by appending an integer.
+
+        Arguments:
+            metric_name: Metric name that corresponds to the metric specified by the
+                    user. For example: 'acc'.
+            output_index: The index of the model output for which the metric name is
+                being added.
+
+        Returns:
+            string, name of the model's unique metric name
+        """
+        if len(self.output_names) > 1:
+            metric_name = '%s_%s' % (self.output_names[output_index], metric_name)
+        j = 1
+        base_metric_name = metric_name
+        while metric_name in self.metrics_names:
+            metric_name = '%s_%d' % (base_metric_name, j)
+            j += 1
+
+        return metric_name
+
+    def _set_per_output_metric_attributes(self, metrics_dict, output_index):
+        """Sets the metric attributes on the model for the given output.
+
+        Arguments:
+            metrics_dict: A dict with metric names as keys and metric fns as values.
+            output_index: The index of the model output for which the metric
+                attributes are added.
+        """
+        for metric_name, metric_fn in metrics_dict.items():
+            metric_name = self._add_unique_metric_name(metric_name, output_index)
+            # Keep track of metric name.
+            self.metrics_names.append(metric_name)
+
+            # Keep track of stateful metric attributes (name and metric function).
+            if isinstance(metric_fn, Layer) and metric_fn.stateful:
+                self.stateful_metric_names.append(metric_name)
+                self.stateful_metric_functions.append(metric_fn)
+
+    def _set_metric_attributes(self, outputs, skip_target_indices=None):
+        """Sets the metric attributes on the model for all the model outputs."""
+        skip_target_indices = skip_target_indices or []
+        for i in range(len(outputs)):
+            if i in skip_target_indices:
+                continue
+            self._set_per_output_metric_attributes(self._per_output_metrics[i], i)
+            self._set_per_output_metric_attributes(
+                    self._per_output_weighted_metrics[i], i)
 
     def compile(self, optimizer,
                 loss=None,
@@ -184,6 +280,39 @@ class Model(Network):
                             str(loss_weights) +
                             ' - expected a list of dicts.')
 
+        # Initialize metrics variables
+        self._init_metric_attributes()
+
+        # Initialize for non-symbolic execution
+        if K.eager:
+          # NOTE: from TensorFlow Keras
+          # Prepare sample weights.
+          self._set_sample_weight_attributes(sample_weight_mode,
+                                             skip_target_weighing_indices)
+          # Save all metric attributes per output of the model.
+          self._cache_output_metric_attributes(metrics, weighted_metrics)
+
+          if target_tensors is not None:
+            raise ValueError('target_tensors are not currently supported in Eager '
+                             'mode.')
+          self.total_loss = None
+          for i in range(len(self.outputs)):
+            if len(self.outputs) > 1:
+              self.metrics_names.append(self.output_names[i] + '_loss')
+
+          # Set metric attributes on model.
+          self._set_metric_attributes(
+              self.outputs,
+              skip_target_indices=skip_target_indices,
+          )
+
+          self.targets = []
+          for i in range(len(self.outputs)):
+            self._feed_output_names.append(self.output_names[i])
+          self._collected_trainable_weights = self.trainable_weights
+          return
+
+
         # Prepare targets of model.
         self.targets = []
         self._feed_targets = []
@@ -321,9 +450,6 @@ class Model(Network):
                 self._feed_sample_weight_modes.append(
                     self.sample_weight_modes[i])
 
-        # Prepare metrics.
-        self.metrics_names = ['loss']
-        self.metrics_tensors = []
 
         # Compute total loss.
         total_loss = None
@@ -364,9 +490,6 @@ class Model(Network):
         nested_metrics = collect_metrics(metrics, self.output_names)
         nested_weighted_metrics = collect_metrics(weighted_metrics,
                                                   self.output_names)
-        self.metrics_updates = []
-        self.stateful_metric_names = []
-        self.stateful_metric_functions = []
 
         def handle_metrics(metrics, weights=None):
             metric_name_prefix = 'weighted_' if weights is not None else ''
@@ -1162,12 +1285,17 @@ class Model(Network):
             ins = x + [0.]
         else:
             ins = x
-        self._make_predict_function()
-        f = self.predict_function
-        return training_arrays.predict_loop(self, f, ins,
-                                            batch_size=batch_size,
-                                            verbose=verbose,
-                                            steps=steps)
+        if hasattr(K, 'eager'):
+            return training_jax.predict_loop(self,
+                self.call,
+                ins, batch_size=batch_size, verbose=verbose, steps=steps)
+        else:
+            self._make_predict_function()
+            f = self.predict_function
+            return training_arrays.predict_loop(self, f, ins,
+                                                batch_size=batch_size,
+                                                verbose=verbose,
+                                                steps=steps)
 
     def train_on_batch(self, x, y,
                        sample_weight=None,

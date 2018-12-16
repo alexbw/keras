@@ -4,6 +4,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from collections import OrderedDict
 import copy
 import numpy as np
 import warnings
@@ -12,6 +13,7 @@ from .. import backend as K
 from .. import losses
 from ..utils import Sequence
 from ..utils.generic_utils import to_list
+from .. import metrics as metrics_module
 
 
 def standardize_single_array(x):
@@ -296,6 +298,61 @@ def check_loss_and_target_compatibility(targets, loss_fns, output_shapes):
                         'targets to have the same shape '
                         'as the output.')
 
+
+def collect_per_output_metric_info(metrics,
+                                                                     output_names,
+                                                                     output_shapes,
+                                                                     loss_fns,
+                                                                     sample_weights=None):
+    """Maps metric names and functions to model outputs.
+
+    Arguments:
+            metrics: a list or dict of metric functions.
+            output_names: a list of the names (strings) of model outputs.
+            output_shapes: a list of the shapes (strings) of model outputs.
+            loss_fns: a list of the loss functions corresponding to the model outputs.
+            sample_weights: a list of weights to be applied on the model outputs.
+
+    Returns:
+            A list (one entry per model output) of dicts.
+            For instance, if the model has 2 outputs, and for the first output
+            we want to compute "binary_accuracy" and "binary_crossentropy",
+            and just "binary_accuracy" for the second output,
+            the list would look like: `[[('acc', binary_accuracy()),
+            ('ce', binary_crossentropy())], [('acc', binary_accuracy())]]`
+
+    Raises:
+            TypeError: if an incorrect type is passed for the `metrics` argument.
+    """
+    if not metrics:
+        return [{} for _ in output_names]
+    if isinstance(metrics, list):
+        # we then apply all metrics to all outputs.
+        nested_metrics = [copy.copy(metrics) for _ in output_names]
+    elif isinstance(metrics, dict):
+        nested_metrics = []
+        for name in output_names:
+            output_metrics = metrics.get(name, [])
+            if not isinstance(output_metrics, list):
+                output_metrics = [output_metrics]
+            nested_metrics.append(output_metrics)
+    else:
+        raise TypeError('Type of `metrics` argument not understood. '
+                                        'Expected a list or dictionary, found: ' + str(metrics))
+
+    per_output_metrics = []
+    for i, metrics in enumerate(nested_metrics):
+        metrics_dict = OrderedDict()
+        for metric in metrics:
+            weighted = False if (sample_weights is None) else (
+                    sample_weights[i] is not None)
+            metric_name = get_metric_name(metric, weighted)
+            metric_fn = get_metric_function(
+                    metric, output_shape=output_shapes[i], loss_fn=loss_fns[i])
+            metrics_dict[metric_name] = metric_fn
+        per_output_metrics.append(metrics_dict)
+
+    return per_output_metrics
 
 def collect_metrics(metrics, output_names):
     """Maps metric functions to model outputs.
@@ -604,3 +661,140 @@ def is_sequence(seq):
     # TODO Dref360: Decide which pattern to follow. First needs a new TF Version.
     return (getattr(seq, 'use_sequence_api', False)
             or set(dir(Sequence())).issubset(set(dir(seq) + ['use_sequence_api'])))
+
+
+
+def get_output_sample_weight_and_mode(skip_target_weighing_indices,
+                                      sample_weight_mode, output_name,
+                                      output_index):
+  """Returns the sample weight and weight mode for a single output."""
+  if output_index in skip_target_weighing_indices:
+    return None, None
+
+  if sample_weight_mode == 'temporal':
+    default_value = [[1.]]
+    shape = [None, None]
+    mode = 'temporal'
+  else:
+    default_value = [1.]
+    shape = [None]
+    mode = None
+  if K.eager:
+    weight = None
+  else:
+    weight = K.placeholder(
+        dtype=K.floatx(),
+        shape=shape,
+        name=output_name + '_sample_weights')
+  return weight, mode
+
+def prepare_sample_weights(output_names, sample_weight_mode,
+                           skip_target_weighing_indices):
+  """Prepares sample weights for the model.
+
+  Args:
+    output_names: List of model output names.
+    sample_weight_mode: sample weight mode user input passed from compile API.
+    skip_target_weighing_indices: Indices of output for which sample weights
+      should be skipped.
+
+  Returns:
+    A pair of list of sample weights and sample weight modes
+      (one for each output).
+
+  Raises:
+    ValueError: In case of invalid `sample_weight_mode` input.
+  """
+  sample_weights = []
+  sample_weight_modes = []
+  if isinstance(sample_weight_mode, dict):
+    unknown_output = set(sample_weight_mode.keys()) - set(output_names)
+    if unknown_output:
+      raise ValueError('Unknown entry in '
+                       'sample_weight_mode dictionary: "' + unknown_output +
+                       '". Only expected the following keys: ' +
+                       str(output_names))
+    for i, name in enumerate(output_names):
+      if (i not in skip_target_weighing_indices and
+          name not in sample_weight_mode):
+        raise ValueError('Output missing from sample_weight_modes dictionary')
+      weight, mode = get_output_sample_weight_and_mode(
+          skip_target_weighing_indices, sample_weight_mode.get(name), name, i)
+      sample_weights.append(weight)
+      sample_weight_modes.append(mode)
+  elif isinstance(sample_weight_mode, list):
+    if len(sample_weight_mode) != len(output_names):
+      raise ValueError('When passing a list as sample_weight_mode, '
+                       'it should have one entry per model output. '
+                       'The model has ' + str(len(output_names)) +
+                       ' outputs, but you passed ' +
+                       str(len(sample_weight_mode)) + 'sample_weight_modes')
+    for i, name in enumerate(output_names):
+      weight, mode = get_output_sample_weight_and_mode(
+          skip_target_weighing_indices, sample_weight_mode[i], name, i)
+      sample_weights.append(weight)
+      sample_weight_modes.append(mode)
+  else:
+    for i, name in enumerate(output_names):
+      weight, mode = get_output_sample_weight_and_mode(
+          skip_target_weighing_indices, sample_weight_mode, name, i)
+      sample_weights.append(weight)
+      sample_weight_modes.append(mode)
+  return sample_weights, sample_weight_modes
+
+def get_metric_name(metric, weighted=False):
+  """Returns the name corresponding to the given metric input.
+
+  Arguments:
+    metric: Metric function name or reference.
+    weighted: Boolean indicating if the given metric is weighted.
+
+  Returns:
+      The metric name.
+  """
+  metric_name_prefix = 'weighted_' if weighted else ''
+  if metric in ('accuracy', 'acc', 'crossentropy', 'ce'):
+    if metric in ('accuracy', 'acc'):
+      suffix = 'acc'
+    elif metric in ('crossentropy', 'ce'):
+      suffix = 'ce'
+  else:
+    metric_fn = metrics_module.get(metric)
+    # Get metric name as string
+    if hasattr(metric_fn, 'name'):
+      suffix = metric_fn.name
+    else:
+      suffix = metric_fn.__name__
+  metric_name = metric_name_prefix + suffix
+  return metric_name
+
+
+def get_metric_function(metric, output_shape=None, loss_fn=None):
+  """Returns the metric function corresponding to the given metric input.
+
+  Arguments:
+      metric: Metric function name or reference.
+      output_shape: The shape of the output that this metric
+          will be calculated for.
+      loss_fn: The loss function used.
+
+  Returns:
+      The metric function.
+  """
+  if metric in ['accuracy', 'acc']:
+    if output_shape[-1] == 1 or loss_fn == losses.binary_crossentropy:
+      return metrics_module.binary_accuracy  # case: binary accuracy
+    elif loss_fn == losses.sparse_categorical_crossentropy:
+      # case: categorical accuracy with sparse targets
+      return metrics_module.sparse_categorical_accuracy
+    return metrics_module.categorical_accuracy  # case: categorical accuracy
+  elif metric in ['crossentropy', 'ce']:
+    if output_shape[-1] == 1 or loss_fn == losses.binary_crossentropy:
+      return metrics_module.binary_crossentropy  # case: binary cross-entropy
+    elif loss_fn == losses.sparse_categorical_crossentropy:
+      # case: categorical cross-entropy with sparse targets
+      return metrics_module.sparse_categorical_crossentropy
+    # case: categorical cross-entropy
+    return metrics_module.categorical_crossentropy
+  return metrics_module.get(metric)
+

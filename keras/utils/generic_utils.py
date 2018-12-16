@@ -14,7 +14,6 @@ import types as python_types
 import inspect
 import codecs
 import collections
-
 _GLOBAL_CUSTOM_OBJECTS = {}
 
 
@@ -613,3 +612,34 @@ def transpose_shape(shape, target_format, spatial_axes):
         raise ValueError('The `data_format` argument must be one of '
                          '"channels_first", "channels_last". Received: ' +
                          str(target_format))
+
+class DeferredNumpyArray(object):
+  """Array-like object used to build graphs of layers with NumPy and JAX.
+
+  When calling a layer on a DeferredNumpyArray, the layer will not perform any
+  computation and will simply perform shape inference to return new
+  DeferredNumpyArrays with appropriate shape information. Thus DeferredNumpyArray
+  behaves like a graph-mode Tensor when manipulated by layers.
+  """
+
+  def __init__(self, shape, dtype, name=None):
+    self.shape = shape
+    if dtype is None:
+      self.dtype = np.dtype(np.float32)
+    else:
+      self.dtype = np.dtype(dtype)
+    self.name = name
+    self.ndim = len(shape)
+
+  def get_shape(self):
+    return self.shape
+
+  def __str__(self):
+    return "DeferredNumpyArray('%s', shape=%s, dtype=%s)" % (self.name,
+                                                         self.shape,
+                                                         self.dtype.name)
+
+  def __repr__(self):
+    return "<DeferredNumpyArray '%s' shape=%s dtype=%s>" % (self.name,
+                                                        self.shape,
+                                                        self.dtype.name)

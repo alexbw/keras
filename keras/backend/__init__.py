@@ -87,6 +87,9 @@ elif _BACKEND == 'theano':
 elif _BACKEND == 'tensorflow':
     sys.stderr.write('Using TensorFlow backend.\n')
     from .tensorflow_backend import *
+elif _BACKEND == 'jax':
+    sys.stderr.write('Using JAX backend.\n')
+    from .jax_backend import *
 else:
     # Try and load external backend.
     try:

@@ -16,6 +16,7 @@ from ..utils.generic_utils import object_list_uid
 from ..utils.generic_utils import to_list
 from ..utils.generic_utils import unpack_singleton
 from ..utils.generic_utils import is_all_none
+from ..utils.generic_utils import DeferredNumpyArray
 from ..legacy import interfaces
 
 
@@ -406,6 +407,10 @@ class Layer(object):
         """
         if isinstance(inputs, list):
             inputs = inputs[:]
+            in_deferred_mode = isinstance(inputs[0], DeferredNumpyArray)
+        else:
+            in_deferred_mode = isinstance(inputs, DeferredNumpyArray)
+
         with K.name_scope(self.name):
             # Handle laying building (weight creating, input spec locking).
             if not self.built:
@@ -454,7 +459,16 @@ class Layer(object):
 
             # Actually call the layer,
             # collecting output(s), mask(s), and shape(s).
-            output = self.call(inputs, **kwargs)
+            if not in_deferred_mode:
+                output = self.call(inputs, **kwargs)
+            else:
+                output_shape = self.compute_output_shape(input_shape)
+                if isinstance(inputs, list):
+                    output = [DeferredNumpyArray(shape=shape, dtype=self.dtype if hasattr(self, 'dtype') else None)
+                    for shape in output_shape]
+                else:
+                    output = DeferredNumpyArray(shape=output_shape, dtype=self.dtype if hasattr(self, 'dtype') else None)
+
             output_mask = self.compute_mask(inputs, previous_mask)
 
             # If the layer returns tensors from its inputs, unmodified,
