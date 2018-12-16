@@ -679,7 +679,7 @@ def get_output_sample_weight_and_mode(skip_target_weighing_indices,
     default_value = [1.]
     shape = [None]
     mode = None
-  if K.eager:
+  if hasattr(K, 'eager'):
     weight = None
   else:
     weight = K.placeholder(

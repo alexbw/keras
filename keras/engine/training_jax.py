@@ -1,9 +1,14 @@
 """Part of the training engine related to plain array data (e.g. Numpy).
+
+# TODO:
+# - Don't run loss function twice when calculating gradients (need grad_and_ans)
+# - Get metrics working
 """
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import copy
 import numpy as onp
 import jax.numpy as np
 from jax import grad
@@ -238,8 +243,9 @@ def test_on_batch(model, inputs, targets, sample_weights=None):
 
     if not isinstance(outs, list):
         outs = [outs]
-    metrics_results = _metrics_fn(
-            model, outs, targets, sample_weights=sample_weights, masks=masks)
+    metrics_results = []
+    # metrics_results = _metrics_fn(
+            # model, outs, targets, sample_weights=sample_weights, masks=masks)
     loss = to_list(loss)
 
     return loss + loss_metrics + metrics_results
@@ -278,11 +284,6 @@ def fit_loop(model,
         val_function: Keras function to call for validation
         val_inputs: List of tensors to be fed to `val_function`
         shuffle: Whether to shuffle the data at the beginning of each epoch
-        callback_metrics: List of strings, the display names of the metrics
-            passed to the callbacks. They should be the
-            concatenation of list the display names of the outputs of
-             `fit_function` and the list of display names
-             of the outputs of `fit_inputs`.
         initial_epoch: Epoch at which to start training
             (useful for resuming a previous training run)
         steps_per_epoch: Total number of steps (batches of samples)
@@ -295,27 +296,24 @@ def fit_loop(model,
     # Returns
         `History` object.
     """
-    do_validation = False
-    if val_function and val_inputs:
-        do_validation = True
-        if (verbose and fit_inputs and
-           hasattr(fit_inputs[0], 'shape') and hasattr(val_inputs[0], 'shape')):
+    do_validation = val_inputs is not None
+    if do_validation:
+        if (verbose and inputs and
+           hasattr(inputs[0], 'shape') and hasattr(val_inputs[0], 'shape')):
             print('Train on %d samples, validate on %d samples' %
-                  (fit_inputs[0].shape[0], val_inputs[0].shape[0]))
-    if validation_steps:
-        do_validation = True
-        if steps_per_epoch is None:
-            raise ValueError('Can only use `validation_steps` '
-                             'when doing step-wise '
-                             'training, i.e. `steps_per_epoch` '
-                             'must be set.')
-    elif do_validation:
-        if steps_per_epoch:
-            raise ValueError('Must specify `validation_steps` '
-                             'to perform validation '
-                             'when doing step-wise training.')
+                  (inputs[0].shape[0], val_inputs[0].shape[0]))
 
-    num_train_samples = check_num_samples(fit_inputs,
+    if validation_steps and steps_per_epoch is None:
+        raise ValueError('Can only use `validation_steps` '
+                         'when doing step-wise '
+                         'training, i.e. `steps_per_epoch` '
+                         'must be set.')
+    elif do_validation and steps_per_epoch:
+        raise ValueError('Must specify `validation_steps` '
+                         'to perform validation '
+                         'when doing step-wise training.')
+
+    num_train_samples = check_num_samples(inputs,
                                           batch_size=batch_size,
                                           steps=steps_per_epoch,
                                           steps_name='steps_per_epoch')
@@ -336,7 +334,6 @@ def fit_loop(model,
                 stateful_metrics=model.stateful_metric_names))
     _callbacks += (callbacks or []) + [model.history]
     callbacks = cbks.CallbackList(_callbacks)
-    out_labels = out_labels or []
 
     # it's possible to callback a different model than itself
     # (used by Sequential models)
@@ -345,6 +342,7 @@ def fit_loop(model,
     else:
         callback_model = model
 
+    callback_metrics = copy.copy(model.metrics_names)
     callbacks.set_model(callback_model)
     callbacks.set_params({
         'batch_size': batch_size,
@@ -354,21 +352,13 @@ def fit_loop(model,
         'verbose': verbose,
         'do_validation': do_validation,
         'metrics': callback_metrics or [],
+        'validation_steps': validation_steps
     })
     callbacks.on_train_begin()
     callback_model.stop_training = False
     for cbk in callbacks:
         cbk.validation_data = val_inputs
 
-    # To prevent a slowdown,
-    # we find beforehand the arrays that need conversion.
-    feed = (model._feed_inputs +
-            model._feed_targets +
-            model._feed_sample_weights)
-    indices_for_conversion_to_dense = []
-    for i in range(len(feed)):
-        if issparse(fit_inputs[i]) and not K.is_sparse(feed[i]):
-            indices_for_conversion_to_dense.append(i)
 
     for epoch in range(initial_epoch, epochs):
         # Reset stateful metrics
@@ -382,11 +372,23 @@ def fit_loop(model,
                 batch_logs['batch'] = step_index
                 batch_logs['size'] = 1
                 callbacks.on_batch_begin(step_index, batch_logs)
-                outs = fit_function(fit_inputs)
 
+                # Train model
+                outs, loss, loss_metrics, masks = _process_single_batch(
+                        model, inputs, targets, sample_weights=sample_weights, training=True)
                 outs = to_list(outs)
-                for l, o in zip(out_labels, outs):
+
+                # Calculate metrics.
+                for l, o in zip(model.metrics_names, outs):
                     batch_logs[l] = o
+                # Required for eager execution
+                metrics_results = _metrics_fn(
+                        model, outs, y, sample_weights=sample_weights, masks=masks)
+                batch_logs['loss'] = K.mean(loss)
+
+                for k, v in zip(model.metrics_names,
+                                                [K.mean(loss)] + loss_metrics + metrics_results):
+                    batch_logs[k] = v
 
                 callbacks.on_batch_end(step_index, batch_logs)
                 if callback_model.stop_training:
@@ -398,24 +400,24 @@ def fit_loop(model,
                                      verbose=0)
                 val_outs = to_list(val_outs)
                 # Same labels assumed.
-                for l, o in zip(out_labels, val_outs):
+                for l, o in zip(model.metrics_names, val_outs):
                     epoch_logs['val_' + l] = o
         else:
             if shuffle == 'batch':
                 index_array = batch_shuffle(index_array, batch_size)
             elif shuffle:
-                np.random.shuffle(index_array)
+                onp.random.shuffle(index_array)
 
             batches = make_batches(num_train_samples, batch_size)
             for batch_index, (batch_start, batch_end) in enumerate(batches):
                 batch_ids = index_array[batch_start:batch_end]
                 try:
-                    if isinstance(fit_inputs[-1], float):
+                    if isinstance(inputs[-1], float):
                         # Do not slice the training phase flag.
                         ins_batch = slice_arrays(
-                            fit_inputs[:-1], batch_ids) + [fit_inputs[-1]]
+                            inputs[:-1], batch_ids) + [inputs[-1]]
                     else:
-                        ins_batch = slice_arrays(fit_inputs, batch_ids)
+                        ins_batch = slice_arrays(inputs, batch_ids)
                 except TypeError:
                     raise TypeError('TypeError while preparing batch. '
                                     'If using HDF5 input data, '
@@ -424,12 +426,14 @@ def fit_loop(model,
                 batch_logs['batch'] = batch_index
                 batch_logs['size'] = len(batch_ids)
                 callbacks.on_batch_begin(batch_index, batch_logs)
-                for i in indices_for_conversion_to_dense:
-                    ins_batch[i] = ins_batch[i].toarray()
 
-                outs = fit_function(ins_batch)
+                # Train model
+                outs, loss, loss_metrics, masks = _process_single_batch(
+                        model, inputs, targets, sample_weights=sample_weights, training=True)
                 outs = to_list(outs)
-                for l, o in zip(out_labels, outs):
+
+                # Calculate metrics.
+                for l, o in zip(model.metrics_names, outs):
                     batch_logs[l] = o
 
                 callbacks.on_batch_end(batch_index, batch_logs)
@@ -443,7 +447,7 @@ def fit_loop(model,
                                              verbose=0)
                         val_outs = to_list(val_outs)
                         # Same labels assumed.
-                        for l, o in zip(out_labels, val_outs):
+                        for l, o in zip(model.metrics_names, val_outs):
                             epoch_logs['val_' + l] = o
         callbacks.on_epoch_end(epoch, epoch_logs)
         if callback_model.stop_training:
@@ -491,15 +495,6 @@ def test_loop(model, f, ins, batch_size=None, verbose=0, steps=None):
         else:
             progbar = Progbar(target=num_samples)
 
-    # To prevent a slowdown,
-    # we find beforehand the arrays that need conversion.
-    feed = (model._feed_inputs +
-            model._feed_targets +
-            model._feed_sample_weights)
-    indices_for_conversion_to_dense = []
-    for i in range(len(feed)):
-        if issparse(ins[i]) and not K.is_sparse(feed[i]):
-            indices_for_conversion_to_dense.append(i)
 
     if steps is not None:
         for step in range(steps):
@@ -532,8 +527,6 @@ def test_loop(model, f, ins, batch_size=None, verbose=0, steps=None):
                 ins_batch = slice_arrays(ins[:-1], batch_ids) + [ins[-1]]
             else:
                 ins_batch = slice_arrays(ins, batch_ids)
-            for i in indices_for_conversion_to_dense:
-                ins_batch[i] = ins_batch[i].toarray()
 
             batch_outs = f(ins_batch)
             if isinstance(batch_outs, list):
@@ -586,10 +579,6 @@ def predict_loop(model, f, ins, batch_size=32, verbose=0, steps=None):
         else:
             progbar = Progbar(target=num_samples)
 
-    indices_for_conversion_to_dense = []
-    for i in range(len(model._feed_inputs)):
-        if issparse(ins[i]) and not K.is_sparse(model._feed_inputs[i]):
-            indices_for_conversion_to_dense.append(i)
 
     if steps is not None:
         # Step-based predictions.
@@ -625,8 +614,6 @@ def predict_loop(model, f, ins, batch_size=32, verbose=0, steps=None):
                 ins_batch = slice_arrays(ins[:-1], batch_ids) + [ins[-1]]
             else:
                 ins_batch = slice_arrays(ins, batch_ids)
-            for i in indices_for_conversion_to_dense:
-                ins_batch[i] = ins_batch[i].toarray()
 
             batch_outs = f(ins_batch)
             batch_outs = to_list(batch_outs)

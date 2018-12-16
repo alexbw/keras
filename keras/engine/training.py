@@ -285,7 +285,7 @@ class Model(Network):
         self._init_metric_attributes()
 
         # Initialize for non-symbolic execution
-        if K.eager:
+        if hasattr(K, 'eager'):
           # NOTE: from TensorFlow Keras
           # Prepare sample weights.
           self._set_sample_weight_attributes(sample_weight_mode,
@@ -1130,7 +1130,7 @@ class Model(Network):
             val_y = None
             val_sample_weights = None
 
-        if K.eager:
+        if hasattr(K, 'eager'):
             return training_jax.fit_loop(
                 self,
                 inputs=x,
@@ -1361,7 +1361,7 @@ class Model(Network):
             x, y,
             sample_weight=sample_weight,
             class_weight=class_weight)
-        if K.eager:
+        if hasattr(K, 'eager'):
             outputs = training_jax.train_on_batch(
                 self, x, y, sample_weights=sample_weights)
         else:
