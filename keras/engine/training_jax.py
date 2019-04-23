@@ -318,7 +318,7 @@ def fit_loop(model,
                                           steps=steps_per_epoch,
                                           steps_name='steps_per_epoch')
     if num_train_samples is not None:
-        index_array = np.arange(num_train_samples)
+        index_array = onp.arange(num_train_samples)
 
     model.history = cbks.History()
     _callbacks = [cbks.BaseLogger(
