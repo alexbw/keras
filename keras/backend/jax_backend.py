@@ -8,8 +8,10 @@ from collections import defaultdict
 import numpy as onp
 import jax.numpy as np
 from jax import lax
+import jax
 # import jax.scipy.signal as signal # TODO!
 import jax.scipy as sp
+from jax import random
 from keras.backend import floatx
 from keras.utils.generic_utils import transpose_shape
 from keras.utils.np_utils import to_categorical
@@ -540,7 +542,7 @@ def argmin(x, axis=-1):
 
 def sqrt(x):
     y = np.sqrt(x)
-    y[np.isnan(y)] = 0.
+    #y[np.isnan(y)] = 0.
     return y
 
 
@@ -722,18 +724,22 @@ def variable(value, dtype=None, name=None, constraint=None):
     if constraint is not None:
         raise TypeError("Constraint must be None when "
                         "using the NumPy backend.")
-    return np.array(value, dtype)
+    return jax.device_put(np.array(value, dtype))
 
+def _get_prng():
+    seed = onp.random.randint(10e3)
+    return random.PRNGKey(seed)
 
 def dropout(x, level, noise_shape=None, seed=None):
     if noise_shape is None:
         noise_shape = x.shape
     if learning_phase():
-        noise = np.random.choice([0, 1],
-                                 noise_shape,
-                                 replace=True,
-                                 p=[level, 1 - level])
-        return x * noise / (1 - level)
+        #noise = np.random.choice([0, 1],
+        #                         noise_shape,
+        #                         replace=True,
+        #                         p=[level, 1 - level])
+	noise = random.bernoulli(_get_prng(), 1. - level, noise_shape)
+        return x * noise / (1. - level)
     else:
         return x
 
